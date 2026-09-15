@@ -17,6 +17,7 @@ import { z } from "zod";
 // =============================================================================
 
 export interface Env {
+  VOICE_EVENTS: DurableObjectNamespace;
   TTS_PROVIDER?: string;
   DASHSCOPE_API_KEY?: string;
   VOICE_ID?: string;
@@ -104,7 +105,7 @@ interface ElevenLabsHistoryItem {
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
 const VOICE_RESOURCE_URI = "ui://voice-mcp/player.html";
-const LATEST_VOICE_CACHE_PATH = "/__voice-mcp/latest-voice-event";
+
 
 // =============================================================================
 // Audio Player HTML (WeChat-style UI)
@@ -2809,10 +2810,6 @@ function getSpeakInputError(text: string): string | undefined {
   return undefined;
 }
 
-function getLatestVoiceCacheRequest(origin: string): Request {
-  return new Request(new URL(LATEST_VOICE_CACHE_PATH, origin).toString(), { method: "GET" });
-}
-
 function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): VoiceEvent {
   const provider = getTtsProvider(env);
   const finalText = result.final_text || input.text;
@@ -2832,21 +2829,58 @@ function createVoiceEvent(env: Env, input: SpeakInput, result: AudioResult): Voi
   };
 }
 
-async function storeLatestVoiceEvent(origin: string, event: VoiceEvent): Promise<void> {
-  await caches.default.put(
-    getLatestVoiceCacheRequest(origin),
-    Response.json(event, {
-      headers: {
-        "Cache-Control": "public, max-age=3600",
-      },
-    }),
-  );
+// All regions use the same object. Chunking keeps audio below per-value limits.
+export class VoiceEventStore {
+  constructor(private state: DurableObjectState) {}
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.method === "PUT") {
+      const serialized = await request.text();
+      await this.state.storage.transaction(async (txn) => {
+        const old = await txn.get<{ count: number }>("meta");
+        if (old) {
+          for (let i = 0; i < old.count; i++) await txn.delete(`chunk:${i}`);
+        }
+        const count = Math.ceil(serialized.length / 60000);
+        for (let i = 0; i < count; i++) {
+          await txn.put(`chunk:${i}`, serialized.slice(i * 60000, (i + 1) * 60000));
+        }
+        await txn.put("meta", { count, expires: Date.now() + 3600000 });
+      });
+      return new Response(null, { status: 204 });
+    }
+    const serialized = await this.state.storage.transaction(async (txn) => {
+      const meta = await txn.get<{ count: number; expires: number }>("meta");
+      if (!meta || meta.expires <= Date.now()) return null;
+      const chunks: string[] = [];
+      for (let i = 0; i < meta.count; i++) {
+        const chunk = await txn.get<string>(`chunk:${i}`);
+        if (chunk === undefined) throw new Error("Incomplete voice event");
+        chunks.push(chunk);
+      }
+      return chunks.join("");
+    });
+    return new Response(serialized || "null", {
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  }
 }
 
-async function readLatestVoiceEvent(origin: string): Promise<VoiceEvent | null> {
-  const response = await caches.default.match(getLatestVoiceCacheRequest(origin));
-  if (!response) return null;
-  return await response.json<VoiceEvent>();
+function voiceEventStore(env: Env): DurableObjectStub {
+  return env.VOICE_EVENTS.get(env.VOICE_EVENTS.idFromName("latest-voice"));
+}
+
+async function storeLatestVoiceEvent(env: Env, event: VoiceEvent): Promise<void> {
+  const response = await voiceEventStore(env).fetch("https://voice-events/latest", {
+    method: "PUT", body: JSON.stringify(event),
+  });
+  if (!response.ok) throw new Error(`Voice event storage failed: ${response.status}`);
+}
+
+async function readLatestVoiceEvent(env: Env): Promise<VoiceEvent | null> {
+  const response = await voiceEventStore(env).fetch("https://voice-events/latest");
+  if (!response.ok) throw new Error(`Voice event read failed: ${response.status}`);
+  return response.json<VoiceEvent | null>();
 }
 
 // =============================================================================
@@ -2917,7 +2951,7 @@ function createVoiceServer(env: Env, origin: string): McpServer {
 
       if (result.success && result.audio_base64) {
         try {
-          await storeLatestVoiceEvent(origin, createVoiceEvent(env, input, result));
+          await storeLatestVoiceEvent(env, createVoiceEvent(env, input, result));
         } catch (error) {
           console.error("Failed to store latest voice event", error);
         }
@@ -2989,7 +3023,7 @@ export default {
     }
 
     if (path === '/events/latest') {
-      const event = await readLatestVoiceEvent(url.origin);
+      const event = await readLatestVoiceEvent(env);
       if (!event || event.id === url.searchParams.get('since')) {
         return Response.json({ event: null }, {
           headers: {
@@ -3025,7 +3059,7 @@ export default {
       }
 
       try {
-        await storeLatestVoiceEvent(url.origin, result.event);
+        await storeLatestVoiceEvent(env, result.event);
       } catch (error) {
         console.error("Failed to store latest voice event", error);
       }
@@ -3095,7 +3129,7 @@ export default {
 
       if (result.success && result.audio_base64) {
         try {
-          await storeLatestVoiceEvent(url.origin, createVoiceEvent(env, input, result));
+          await storeLatestVoiceEvent(env, createVoiceEvent(env, input, result));
         } catch (error) {
           console.error("Failed to store latest voice event", error);
         }
