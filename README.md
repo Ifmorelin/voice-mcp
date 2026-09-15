@@ -20,6 +20,7 @@ This fork lives at [Yinglianchun/voice-mcp](https://github.com/Yinglianchun/voic
 - Added `/panel`, a breathing audio visualizer that listens for the latest MCP `speak` result.
 - Added `/events/latest` so the panel can receive the newest generated voice and text.
 - Added ElevenLabs history loading through `/history?id=...`.
+- Added local audio upload with exact-transcript forced alignment for synced captions.
 - Added line-style captions, playback-linked caption timing when ElevenLabs timing data is available, and MP3 download from the panel.
 
 ## Features
@@ -151,6 +152,7 @@ npx wrangler deploy
 | `GET /panel` | Breathing voice visualizer that listens for MCP `speak` |
 | `GET /events/latest` | Latest generated voice event for the visualizer |
 | `GET /history?id=...` | Load an ElevenLabs history item into the visualizer |
+| `POST /upload` | Upload audio plus an exact transcript for synchronized captions |
 | `GET /speak?text=Hello` | Direct audio file |
 | `GET /speak?text=Hello&style=soft` | Direct audio file with optional style |
 | `GET /speak?text=[whispers]%20Hello` | Preserve detected ElevenLabs v3 audio tags |
@@ -171,6 +173,10 @@ When the MCP `speak` tool succeeds, the Worker stores the latest voice event for
 visualizer loads it and enables playback.
 ElevenLabs uses the speech-with-timing API to store line-level caption cues for
 sync; providers without timing data fall back to approximate caption progress.
+The visualizer also accepts a local audio file plus its exact transcript. It uses
+ElevenLabs Forced Alignment to build caption cues without regenerating the voice.
+Audio uploads are limited to 12 MB; MP3, WAV, M4A/MP4, AAC, OGG, and WebM are
+accepted when the browser supplies a compatible audio type.
 
 When `TTS_PROVIDER=elevenlabs` and `ELEVENLABS_MODEL_ID=eleven_v3`, detected
 audio tags such as `[whispers]` and `[sighs]` are preserved automatically.

@@ -73,6 +73,8 @@ interface VoiceEvent {
   id: string;
   text: string;
   audio_base64: string;
+  audio_mime_type?: string;
+  download_filename?: string;
   created_at: string;
   provider: TtsProvider;
   model_id: string;
@@ -105,6 +107,8 @@ interface ElevenLabsHistoryItem {
 
 const EXT_APPS_MIME = "text/html;profile=mcp-app" as const;
 const VOICE_RESOURCE_URI = "ui://voice-mcp/player.html";
+const MAX_UPLOAD_AUDIO_BYTES = 12 * 1024 * 1024;
+const MAX_UPLOAD_TRANSCRIPT_CHARS = 50_000;
 
 
 // =============================================================================
@@ -1248,6 +1252,24 @@ function getVisualizerPanelHTML(botName: string): string {
       cursor: wait;
       opacity: 0.66;
     }
+    .upload-loader {
+      border-top: 1px solid color-mix(in oklch, var(--line), transparent 28%);
+      padding-top: var(--space-md);
+    }
+    .upload-summary { width: max-content; color: var(--ice); cursor: pointer; font-size: 0.82rem; font-weight: 720; letter-spacing: 0.04em; list-style: none; }
+    .upload-summary::-webkit-details-marker { display: none; }
+    .upload-summary::before { content: "+"; display: inline-block; width: 1.35em; color: var(--green); }
+    .upload-loader[open] .upload-summary::before { content: "−"; }
+    .upload-form { display: grid; gap: var(--space-sm); margin-top: var(--space-md); }
+    .upload-file-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: var(--space-sm); }
+    .upload-file { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+    .upload-pick, .upload-submit { min-height: 40px; border: 1px solid var(--line); border-radius: 999px; background: oklch(0.1 0.014 220 / 0.72); color: var(--ice); padding: 0 14px; font-weight: 720; cursor: pointer; }
+    .upload-pick { display: inline-flex; align-items: center; justify-content: center; }
+    .upload-file:focus-visible + .upload-pick { border-color: var(--ice); box-shadow: 0 0 0 3px oklch(0.72 0.08 196 / 0.18); }
+    .upload-name { min-width: 0; overflow: hidden; color: var(--muted); font-size: 0.82rem; text-overflow: ellipsis; white-space: nowrap; }
+    .upload-transcript { min-height: 88px; max-height: 220px; }
+    .upload-submit { justify-self: end; }
+    .upload-submit:disabled { cursor: wait; opacity: 0.66; }
     label {
       color: var(--muted);
       font-size: 0.8rem;
@@ -1421,6 +1443,9 @@ function getVisualizerPanelHTML(botName: string): string {
       .receiver { align-items: flex-start; }
       .receiver-actions { gap: var(--space-sm); }
       .history-row { grid-template-columns: 1fr; }
+      .upload-file-row { grid-template-columns: 1fr; }
+      .upload-pick, .upload-submit { width: 100%; }
+      .upload-submit { justify-self: stretch; }
       .controls { grid-template-columns: 1fr; }
       .actions { justify-content: space-between; }
       .transport { grid-template-columns: 50px 1fr 42px; }
@@ -1477,6 +1502,20 @@ function getVisualizerPanelHTML(botName: string): string {
           </div>
         </form>
 
+        <details class="upload-loader" id="uploadPanel">
+          <summary class="upload-summary">Upload audio + sync captions</summary>
+          <form class="upload-form" id="uploadForm">
+            <div class="upload-file-row">
+              <input class="upload-file" id="audioFile" name="audio" type="file" accept="audio/*" required>
+              <label class="upload-pick" for="audioFile">Choose audio</label>
+              <span class="upload-name" id="audioFileName">No file selected</span>
+            </div>
+            <label for="uploadTranscript">Exact transcript</label>
+            <textarea class="upload-transcript" id="uploadTranscript" name="text" autocomplete="off" spellcheck="false" placeholder="Paste the exact spoken text. Audio tags such as [whispers] are removed before alignment." required></textarea>
+            <button class="upload-submit" id="uploadButton" type="submit">Load &amp; sync</button>
+          </form>
+        </details>
+
         <div class="transport">
           <button class="play" id="playButton" type="button" aria-label="Play voice" disabled>
             <svg viewBox="0 0 24 24"><path id="playIcon" d="M8 5v14l11-7z"></path></svg>
@@ -1520,6 +1559,11 @@ function getVisualizerPanelHTML(botName: string): string {
     const historyForm = document.getElementById('historyForm');
     const historyIdInput = document.getElementById('historyId');
     const historyLoadButton = document.getElementById('historyLoadButton');
+    const uploadForm = document.getElementById('uploadForm');
+    const audioFileInput = document.getElementById('audioFile');
+    const audioFileName = document.getElementById('audioFileName');
+    const uploadTranscript = document.getElementById('uploadTranscript');
+    const uploadButton = document.getElementById('uploadButton');
     const playButton = document.getElementById('playButton');
     const playIcon = document.getElementById('playIcon');
     const downloadButton = document.getElementById('downloadButton');
@@ -1642,13 +1686,13 @@ function getVisualizerPanelHTML(botName: string): string {
       return 'haven-voice-' + stamp + '-' + makeFilenameText(text) + '.mp3';
     }
 
-    function createAudioObjectUrlFromBase64(base64) {
+    function createAudioObjectUrlFromBase64(base64, mimeType) {
       const binary = atob(base64);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
       }
-      return URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+      return URL.createObjectURL(new Blob([bytes], { type: mimeType || 'audio/mpeg' }));
     }
 
     function stripAudioTagsForDisplay(text) {
@@ -1788,6 +1832,43 @@ function getVisualizerPanelHTML(botName: string): string {
       }
     }
 
+    async function uploadAudio(event) {
+      event.preventDefault();
+
+      const file = audioFileInput.files && audioFileInput.files[0];
+      const text = uploadTranscript.value.trim();
+      if (!file) {
+        setMessage('Choose an audio file', true);
+        return;
+      }
+      if (!text) {
+        setMessage('Paste the exact transcript for caption sync', true);
+        return;
+      }
+
+      uploadButton.disabled = true;
+      receiverText.textContent = 'aligning upload';
+      setMessage('Uploading audio and syncing captions');
+
+      try {
+        const formData = new FormData();
+        formData.append('audio', file, file.name);
+        formData.append('text', text);
+        const response = await fetch('/upload', { method: 'POST', body: formData });
+        const data = await response.json();
+        if (!response.ok || !data.event) throw new Error(data.error || 'Audio upload failed');
+        receiveVoiceEvent(data.event);
+        setMessage(data.event.caption_cues?.length
+          ? 'Ready to play · captions synced'
+          : 'Ready to play · caption timing is approximate');
+      } catch (error) {
+        receiverText.textContent = 'upload failed';
+        setMessage(error instanceof Error ? error.message : String(error), true);
+      } finally {
+        uploadButton.disabled = false;
+      }
+    }
+
     function receiveVoiceEvent(event) {
       if (!event || event.id === lastEventId || !event.audio_base64) return;
       lastEventId = event.id;
@@ -1800,8 +1881,8 @@ function getVisualizerPanelHTML(botName: string): string {
       audio.pause();
       audio.removeAttribute('src');
       audio.load();
-      objectUrl = createAudioObjectUrlFromBase64(event.audio_base64);
-      downloadName = createDownloadName(event.text || '', event.created_at);
+      objectUrl = createAudioObjectUrlFromBase64(event.audio_base64, event.audio_mime_type);
+      downloadName = event.download_filename || createDownloadName(event.text || '', event.created_at);
       audio.src = objectUrl;
       audio.load();
 
@@ -2029,6 +2110,11 @@ function getVisualizerPanelHTML(botName: string): string {
     });
 
     historyForm.addEventListener('submit', loadHistoryItem);
+    uploadForm.addEventListener('submit', uploadAudio);
+    audioFileInput.addEventListener('change', () => {
+      const file = audioFileInput.files && audioFileInput.files[0];
+      audioFileName.textContent = file ? file.name : 'No file selected';
+    });
 
     dockCloseButton.addEventListener('click', hideDock);
     dockPanel.addEventListener('click', (event) => event.stopPropagation());
@@ -2624,12 +2710,18 @@ function hasUsableCaptionCues(text: string, cues: CaptionCue[]): boolean {
   return hasSubstantialCue || visibleLength <= 20;
 }
 
-async function createForcedAlignment(env: Env, text: string, audioBuffer: ArrayBuffer): Promise<ElevenLabsAlignment | undefined> {
+async function createForcedAlignment(
+  env: Env,
+  text: string,
+  audioBuffer: ArrayBuffer,
+  mimeType = "audio/mpeg",
+  filename = "audio.mp3",
+): Promise<ElevenLabsAlignment | undefined> {
   const apiKey = env.ELEVENLABS_API_KEY;
   if (!apiKey || !text.trim()) return undefined;
 
   const formData = new FormData();
-  formData.append("file", new Blob([audioBuffer], { type: "audio/mpeg" }), "history.mp3");
+  formData.append("file", new Blob([audioBuffer], { type: mimeType }), filename);
   formData.append("text", text);
 
   const response = await fetch("https://api.elevenlabs.io/v1/forced-alignment", {
@@ -2674,6 +2766,48 @@ async function createForcedAlignment(env: Env, text: string, audioBuffer: ArrayB
     character_start_times_seconds: starts,
     character_end_times_seconds: ends,
   };
+}
+
+function getUploadedAudioMimeType(file: File): string | undefined {
+  const mimeType = file.type.trim().toLowerCase();
+  if (mimeType.startsWith("audio/")) return mimeType;
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  const mimeByExtension: Record<string, string> = {
+    mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", mp4: "audio/mp4",
+    aac: "audio/aac", ogg: "audio/ogg", webm: "audio/webm",
+  };
+  return extension ? mimeByExtension[extension] : undefined;
+}
+
+function sanitizeUploadedFilename(filename: string, mimeType: string): string {
+  const cleaned = filename.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "-").replace(/\s+/g, " ").trim().slice(0, 120);
+  if (cleaned) return cleaned;
+  if (mimeType.includes("wav")) return "uploaded-voice.wav";
+  if (mimeType.includes("mp4")) return "uploaded-voice.m4a";
+  if (mimeType.includes("ogg")) return "uploaded-voice.ogg";
+  return "uploaded-voice.mp3";
+}
+
+async function createUploadedVoiceEvent(env: Env, file: File, transcript: string): Promise<{ event?: VoiceEvent; error?: string }> {
+  const text = transcript.trim();
+  if (!text) return { error: "Exact transcript is required for caption sync" };
+  if (text.length > MAX_UPLOAD_TRANSCRIPT_CHARS) return { error: `Transcript exceeds ${MAX_UPLOAD_TRANSCRIPT_CHARS.toLocaleString()} characters` };
+  if (file.size <= 0) return { error: "Uploaded audio is empty" };
+  if (file.size > MAX_UPLOAD_AUDIO_BYTES) return { error: "Uploaded audio exceeds the 12 MB limit" };
+  const mimeType = getUploadedAudioMimeType(file);
+  if (!mimeType) return { error: "Unsupported audio file type" };
+
+  const audioBuffer = await file.arrayBuffer();
+  const alignmentText = stripAudioTags(text) || text;
+  const filename = sanitizeUploadedFilename(file.name, mimeType);
+  const alignment = await createForcedAlignment(env, alignmentText, audioBuffer, mimeType, filename);
+  const captionCues = alignment ? createCaptionCues(alignmentText, alignment) : [];
+  return { event: {
+    id: crypto.randomUUID(), text, audio_base64: arrayBufferToBase64(audioBuffer),
+    audio_mime_type: mimeType, download_filename: filename, created_at: new Date().toISOString(),
+    provider: "elevenlabs", model_id: "uploaded-audio",
+    caption_cues: captionCues.length ? captionCues : undefined,
+  } };
 }
 
 async function fetchElevenLabsHistoryEvent(env: Env, historyItemId: string): Promise<{ success: boolean; event?: VoiceEvent; error?: string }> {
@@ -3069,6 +3203,40 @@ export default {
           ...corsHeaders,
           "Cache-Control": "no-store",
         },
+      });
+    }
+
+    if (path === '/upload' && request.method === 'POST') {
+      const contentLength = Number(request.headers.get('content-length') || 0);
+      if (Number.isFinite(contentLength) && contentLength > MAX_UPLOAD_AUDIO_BYTES + 1_000_000) {
+        return Response.json({ error: 'Upload exceeds the 12 MB audio limit' }, { status: 413, headers: corsHeaders });
+      }
+
+      let formData: FormData;
+      try {
+        formData = await request.formData();
+      } catch (_error) {
+        return Response.json({ error: 'Expected a multipart audio upload' }, { status: 400, headers: corsHeaders });
+      }
+      const audio = formData.get('audio') as unknown;
+      const transcript = formData.get('text');
+      if (!audio || typeof audio !== 'object' || typeof (audio as { arrayBuffer?: unknown }).arrayBuffer !== 'function') {
+        return Response.json({ error: 'Missing audio file' }, { status: 400, headers: corsHeaders });
+      }
+      if (typeof transcript !== 'string') {
+        return Response.json({ error: 'Missing exact transcript' }, { status: 400, headers: corsHeaders });
+      }
+      const result = await createUploadedVoiceEvent(env, audio as File, transcript);
+      if (!result.event) {
+        return Response.json({ error: result.error || 'Audio upload failed' }, { status: 400, headers: corsHeaders });
+      }
+      try {
+        await storeLatestVoiceEvent(env, result.event);
+      } catch (error) {
+        console.error("Failed to store uploaded voice event", error);
+      }
+      return Response.json({ event: result.event }, {
+        headers: { ...corsHeaders, 'Cache-Control': 'no-store' },
       });
     }
 
