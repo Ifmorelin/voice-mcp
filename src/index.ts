@@ -1506,7 +1506,7 @@ function getVisualizerPanelHTML(botName: string): string {
           <summary class="upload-summary">Upload audio + sync captions</summary>
           <form class="upload-form" id="uploadForm">
             <div class="upload-file-row">
-              <input class="upload-file" id="audioFile" name="audio" type="file" accept="audio/*" required>
+              <input class="upload-file" id="audioFile" name="audio" type="file" accept=".mp3,.wav,.m4a,.mp4,.aac,.ogg,.webm,audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg,audio/webm" required>
               <label class="upload-pick" for="audioFile">Choose audio</label>
               <span class="upload-name" id="audioFileName">No file selected</span>
             </div>
